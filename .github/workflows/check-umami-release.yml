@@ -1,0 +1,86 @@
+name: Check stable Umami releases
+
+on:
+  schedule:
+    - cron: '23 12 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: umami-release-check
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'rodrigomoyano11/umami'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM: umami-software/umami
+      BASE: aguas-mornas
+    steps:
+      - name: Prepare an update for review
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/package.json?ref=$BASE" --jq .content | base64 -d | jq -er .version)
+          [[ "$current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if [[ "${tag#v}" == "$current" || "$(printf '%s\n' "${tag#v}" "$current" | sort -V | tail -1)" == "$current" ]]; then
+            echo "Aguas Mornas already uses $current. Latest stable release is $tag."
+            exit 0
+          fi
+
+          branch="umami-release/$tag"
+          if [[ $(gh pr list --repo "$GITHUB_REPOSITORY" --base "$BASE" --head "$branch" --state open --json number --jq length) != 0 ]]; then
+            echo "A pull request for $tag is already open."
+            exit 0
+          fi
+
+          gh auth setup-git
+          git init -q "$RUNNER_TEMP/umami-release"
+          cd "$RUNNER_TEMP/umami-release"
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git fetch --no-tags origin "refs/heads/$BASE:refs/remotes/origin/$BASE"
+          git fetch --no-tags upstream "refs/tags/$tag:refs/tags/$tag"
+          git switch -c "$branch" "origin/$BASE"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          if ! git merge --no-commit --no-ff "$tag"; then
+            echo "::error::Resolve the conflicts between $BASE and $tag before updating."
+            git diff --name-only --diff-filter=U
+            exit 1
+          fi
+
+          # The workflow token cannot update GitHub Actions definitions.
+          if ! git diff --cached --quiet -- .github/workflows; then
+            git restore --source=HEAD --staged --worktree -- .github/workflows
+          fi
+
+          git commit -m "chore(deps): update Umami to $tag"
+          if git ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null; then
+            git fetch --no-tags origin "refs/heads/$branch"
+            [[ $(git rev-parse HEAD^{tree}) == $(git rev-parse FETCH_HEAD^{tree}) ]] || {
+              echo "::error::The existing update branch has different changes. Review it before opening a PR."
+              exit 1
+            }
+          else
+            git push origin "HEAD:refs/heads/$branch"
+          fi
+
+          gh pr create --repo "$GITHUB_REPOSITORY" --base "$BASE" --head "$branch" \
+            --title "chore(deps): update Umami to $tag" --body-file - <<EOF
+          Upstream release: https://github.com/$UPSTREAM/releases/tag/$tag
+
+          Review release notes and database migrations before merging. Verify Aguas Mornas in production before bringing the same version to the shared instance on master.
+
+          GitHub Actions definitions are kept from the fork. Review upstream workflow changes separately.
+          EOF
