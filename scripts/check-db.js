@@ -71,7 +71,10 @@ async function checkDatabaseVersion() {
 
 async function applyMigration() {
   if (!process.env.SKIP_DB_MIGRATION) {
-    const directUrl = process.env.DIRECT_DATABASE_URL || process.env.DATABASE_URL;
+    const directUrl =
+      process.env.DATABASE_URL_UNPOOLED ||
+      process.env.DIRECT_DATABASE_URL ||
+      process.env.DATABASE_URL;
     console.log(
       execSync('prisma migrate deploy', {
         env: { ...process.env, DATABASE_URL: directUrl },
